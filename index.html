@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <link rel="stylesheet" href="./public/css/webcam.css">
+  <title>MVP sinte facial</title>
+
+  <script src="./public/js/face-api.min.js"></script>
+  <script src="https://unpkg.com/tone@14.8.49/build/Tone.js"></script>
+</head>
+<body>
+  <div id="controls">
+    <button id="startAudio">Habilitar audio</button>
+    <span id="status">audio: OFF</span>
+  </div>
+
+  <div class="stage">
+    <video id="inputVideo" autoplay muted playsinline onloadedmetadata="onPlay()"></video>
+    <canvas id="overlay" width="720" height="560"></canvas>
+  </div>
+
+<script>
+const video = document.getElementById('inputVideo');
+const canvas = document.getElementById('overlay');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+
+let audioReady = false;
+let synthMel, synthBlip, filter, panner, reverb;
+let scale = [];
+let waveType = 'triangle';
+
+document.getElementById('startAudio').addEventListener('click', async () => {
+  await Tone.start();
+  reverb = new Tone.Reverb({ decay: 2.2, wet: 0.25 }).toDestination();
+  panner = new Tone.Panner(0).connect(reverb);
+  filter = new Tone.Filter({ frequency: 1200, type: 'lowpass' }).connect(panner);
+
+  synthMel = new Tone.PolySynth(Tone.Synth, {
+    oscillator: { type: waveType },
+    envelope:   { attack: 0.01, decay: 0.2, sustain: 0.3, release: 0.3 }
+  }).connect(filter);
+
+  synthBlip = new Tone.Synth({
+    oscillator: { type: 'square' },
+    envelope:   { attack: 0.001, decay: 0.08, sustain: 0.0, release: 0.01 }
+  }).connect(panner);
+
+  Tone.Transport.bpm.value = 90;
+  Tone.Transport.scheduleRepeat(time => tick(time), '8n');
+  Tone.Transport.start();
+
+  audioReady = true;
+  statusEl.textContent = 'audio: ON';
+  document.getElementById('startAudio').disabled = true;
+});
+
+(async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    video.srcObject = stream;
+  } catch (e) {
+    alert('No se pudo iniciar la webcam. Probá en Chrome por http://localhost');
+    console.error(e);
+  }
+})();
+
+const MODEL_URL = './public/models';
+const FPS_INTERVAL_MS = 100;
+const MOUTH_MIN = 0.15;
+const MOUTH_MAX = 0.65;
+
+let personSeedReady = false;
+
+async function onPlay() {
+  try {
+    await faceapi.loadSsdMobilenetv1Model(MODEL_URL);
+    await faceapi.loadFaceLandmarkModel(MODEL_URL);
+    await faceapi.loadFaceExpressionModel(MODEL_URL);
+    await faceapi.loadFaceRecognitionModel(MODEL_URL);
+  } catch (e) {
+    alert('No se pudieron cargar los modelos. Revisá ./public/models');
+    console.error(e);
+    return;
+  }
+  detectLoop();
+}
+
+async function detectLoop() {
+  if (video.paused || video.ended) {
+    requestAnimationFrame(detectLoop);
+    return;
+  }
+
+  const dets = await faceapi
+    .detectAllFaces(video, new faceapi.SsdMobilenetv1Options())
+    .withFaceLandmarks()
+    .withFaceExpressions()
+    .withFaceDescriptors();
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const dims = faceapi.matchDimensions(canvas, video, true);
+  const resized = faceapi.resizeResults(dets, dims);
+
+  faceapi.draw.drawDetections(canvas, resized);
+  faceapi.draw.drawFaceLandmarks(canvas, resized);
+  faceapi.draw.drawFaceExpressions(canvas, resized, 0.05);
+
+  if (dets.length > 0) {
+    const best = dets
+      .map(d => ({ d, area: d.detection.box.width * d.detection.box.height }))
+      .sort((a,b) => b.area - a.area)[0].d;
+
+    const lm = best.landmarks;
+    const desc = best.descriptor;
+
+    if (!personSeedReady && desc) {
+      const seed = hashDescriptor(desc);
+      const scales = [
+        ['C4','D4','E4','G4','A4','C5','D5','E5','G5','A5'],
+        ['D4','E4','F4','G4','A4','B4','C5','D5'],
+        ['F4','G4','A4','B4','C5','D5','E5','F5'],
+        ['G4','A4','B4','C5','D5','E5','F5','G5']
+      ];
+      scale = scales[Math.floor(seed * scales.length)];
+      waveType = seed < 0.25 ? 'triangle' : seed < 0.5 ? 'sawtooth' : seed < 0.75 ? 'square' : 'sine';
+      if (audioReady) synthMel.set({ oscillator: { type: waveType }});
+      personSeedReady = true;
+    }
+
+    const mo = mouthOpenness(lm);
+
+    const box = best.detection.box;
+    const cxNorm = (box.x + box.width/2) / video.videoWidth;
+    const cyNorm = (box.y + box.height/2) / video.videoHeight;
+    const panVal = (cxNorm * 2 - 1) * 0.8;
+    const cutoff = 400 + (1 - cyNorm) * 3000;
+
+    if (audioReady) {
+      panner.pan.rampTo(panVal, 0.05);
+      filter.frequency.rampTo(cutoff, 0.05);
+    }
+
+    lastMO = mo;
+  }
+
+  setTimeout(() => requestAnimationFrame(detectLoop), FPS_INTERVAL_MS);
+}
+
+
+let lastMO = 0.0;
+
+function tick(time) {
+  if (!audioReady || scale.length === 0) return;
+  const moClamped = clamp(norm(lastMO, MOUTH_MIN, MOUTH_MAX), 0, 1);
+  const idx = Math.floor(moClamped * (scale.length - 1));
+  const note = scale[idx];
+
+  const restProb = 1 - moClamped;
+  if (Math.random() < restProb * 0.5) return;
+
+  synthMel.triggerAttackRelease(note, 0.25, time, 0.9);
+}
+
+
+function mouthOpenness(landmarks) {
+  const mouth = landmarks.getMouth();
+  const upper = mouth[13];
+  const lower = mouth[19];
+  const left  = mouth[0];
+  const right = mouth[6];
+  const v = dist(upper, lower);
+  const h = dist(left, right) + 1e-6;
+  return v / h;
+}
+
+function hashDescriptor(desc) {
+  let sum = 0;
+  for (let i = 0; i < desc.length; i++) sum += Math.abs(desc[i]) * (i+1);
+  const s = Math.sin(sum) * 0.5 + 0.5;
+  return s;
+}
+
+function dist(a, b) { const dx = a.x - b.x, dy = a.y - b.y; return Math.hypot(dx, dy); }
+function norm(x, min, max) { return (x - min) / (max - min); }
+function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+</script>
+</body>
+</html>
