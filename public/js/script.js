@@ -15,7 +15,7 @@ const debugBPM = document.getElementById("debugBPM");
 
 const uiHintBoxEl = document.getElementById("uiHintBox");
 
-const MODEL_URL = "./public/models";
+const MODEL_URL = "./models";
 const FPS_INTERVAL_MS = 400; 
 const MOUTH_MIN = 0.15;
 const MOUTH_MAX = 0.65;
